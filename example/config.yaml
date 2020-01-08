@@ -1,0 +1,20 @@
+# 基础配置
+elasticsearch:
+  url: "http://192.168.1.1:9200"
+
+# 变量
+env:
+  today_one: 
+    shell: "date +%Y.%m.%d"
+  today_two:
+    shell: "date +%Y%m%d"
+
+snapshot:
+  repository: "{today_two}" 
+  body:
+    type: "s3"
+    settings: 
+      bucket: "backup"
+      base_path: "elasticsearch/{today_two}"
+      endpoint: "ap-northeast-1"
+      compress: True
