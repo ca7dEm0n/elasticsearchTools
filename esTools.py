@@ -6,11 +6,14 @@
 @Motto: 欲目千里，更上一层
 @message: ES操作工具
 '''
+import os
+import yaml
+
 import logging.config
 import argparse
-import yaml
-import json
-import os
+
+from abc import ABCMeta
+from abc import abstractmethod
 
 from ast import literal_eval
 from elasticsearch import Elasticsearch
@@ -49,8 +52,6 @@ def _log_config(level):
 
 
 # nothing to do
-
-
 class QuietLOG:
     @classmethod
     def debug(self, message):
@@ -70,11 +71,14 @@ logging.config.dictConfig(_log_config("INFO"))
 
 parser = argparse.ArgumentParser()
 parser.add_argument("mode",
-                    choices=["playbook", "shell"],
-                    help="选择运行模式: playbook/shell")
+                    choices=["playbook", "cmd"],
+                    help="选择运行模式: playbook/cmd")
+parser.add_argument("-cmd", metavar="cmd", default="", help='输入操作指令')
 parser.add_argument("-v", default=0, action="count", help="-vv开启DEBUG模式,默认-v")
 parser.add_argument("-c", default="config.yaml", help="指定配置文件,默认config.yaml")
+parser.add_argument("-s", default="http://127.0.0.1:9200", help="指定ES主机")
 parser.add_argument("-q", action="store_true", help="安静模式")
+
 parser.add_argument("--playbook", help="playbook")
 parser.add_argument("--force", action="store_true", help="强制模式")
 
@@ -87,10 +91,6 @@ logger = logging.getLogger(__file__)
 
 if args.q:
     logger = QuietLOG
-
-
-class Base:
-    pass
 
 
 class Config:
@@ -125,7 +125,7 @@ class Config:
         logger.debug("config env: {}".format(str(self.env)))
 
     @classmethod
-    def read(self, filePath):
+    def read(cls, filePath):
         '''
         @description: 读取yaml配置
         @param {string}  filePath 文件路径 
@@ -137,7 +137,7 @@ class Config:
         return None
 
     @classmethod
-    def format_data(self, source_data, mapping_dict):
+    def format_data(cls, source_data, mapping_dict):
         '''
         @description: 返回渲染后的data
         @param {dict}    source_data未经渲染数据
@@ -163,7 +163,7 @@ class Config:
             return source_data
 
     @classmethod
-    def _run_python(self, command):
+    def _run_python(cls, command):
         '''
         @description: 执行python代码
         '''
@@ -177,7 +177,7 @@ class Config:
             return command
 
     @classmethod
-    def _run_shell(self, command):
+    def _run_shell(cls, command):
         '''
         @description: 执行shell脚本
         '''
@@ -191,7 +191,34 @@ class Config:
             return command
 
 
-class PlayBook:
+class Job:
+
+    __metaclass__ = ABCMeta
+
+    def __init__(self, es):
+        self.es = es
+
+    def get_index_list(self, index="*"):
+        '''
+        @description: 获取index列表
+        '''
+        result = self.es.indices.get_alias(index)
+        if result:
+            return [_ for _ in result]
+        return result
+
+    def get_job(self, job):
+        '''
+        description: 获取任务方法
+        '''
+        return getattr(self, "job_{}".format(job), None)
+
+    @abstractmethod
+    def run(self):
+        pass
+
+
+class PlayBook(Job):
     def __init__(self, config, settings=None, es=None, force=False):
         self.es = es
         self.config = config
@@ -201,7 +228,7 @@ class PlayBook:
     def run(self):
         for _ in self.config:
             job_type = _["job"]
-            job_function = getattr(self, "job_{}".format(job_type), None)
+            job_function = self.get_job(job_type)
             if job_function:
                 job_function(_)
 
@@ -235,6 +262,32 @@ class PlayBook:
             logger.debug("获取快照仓库,返回为空")
         return result
 
+    def watch_snapshot_job(self,
+                           repository_name,
+                           snapshot_name,
+                           sleep_time=10,
+                           stop_state=[
+                               "SUCCESS",
+                           ],
+                           max_watch=999):
+        '''
+        @description: 持续监听snapshot任务状态
+        '''
+        from time import sleep
+        status = ""
+        while max_watch >= 0:
+            max_watch -= 1
+            status = self.get_snapshot(repository_name,
+                                       snapshot_name)['snapshots'][0]['state']
+            if status in stop_state:
+                return True, status
+            logger.debug("监听快照[{}], 状态:{}".format(snapshot_name, status))
+            sleep(sleep_time)
+
+        logger.warning("监听快照[{}]达到最大值{},返回最后状态{}".format(
+            snapshot_name, max_watch, status))
+        return False, status
+
     def create_snapshot(self, repository_name, snapshot_name, body):
         '''
         @description: 创建快照
@@ -253,6 +306,8 @@ class PlayBook:
                                                  snapshot_name, body)
                 if result.get("acknowledged", ""):
                     logger.debug("创建快照[{}]成功".format(snapshot_name))
+                    _, status = self.watch_snapshot_job(
+                        repository_name, snapshot_name)
                     return True
             except NotFoundError as e:
                 logger.error("创建快照[{}]失败,错误信息:{}".format(snapshot_name, e))
@@ -261,6 +316,8 @@ class PlayBook:
                 is_exits = self.get_snapshot(repository_name, snapshot_name)
                 if is_exits:
                     logger.debug("快照[{}]已经存在".format(snapshot_name))
+                    _, status = self.watch_snapshot_job(
+                        repository_name, snapshot_name)
                     return True
                 _base_num += 1
                 logger.warning("创建快照[{}]失败(第{}次尝试,休息{}秒),错误信息:{}".format(
@@ -297,9 +354,49 @@ class PlayBook:
         index_list = config["index"]
         index_body = config["body"]
 
-        self._exe_create_s3_snapshot_job(snapshot_repository_name,
-                                         snapshot_repository_post_body,
-                                         index_list, index_body)
+        snapshot_name = config.get("snapshot_name", None)
+
+        include_mode = config.get("include_mode", False)
+
+        self._exe_create_snapshot_job(snapshot_repository_name,
+                                      snapshot_repository_post_body,
+                                      index_list,
+                                      index_body,
+                                      include_mode,
+                                      snapshot_name=snapshot_name)
+
+    def _exe_update_alias_job(self, body):
+        '''
+        description: 修改别名
+        '''
+        result = self.es.indices.update_aliases({"actions": body})
+        if result.get("acknowledged", ""):
+            for _ in body:
+                _job_name = None
+                _index = None
+                _alias = None
+                if _.get("remove", ""):
+                    _job_name = "删除"
+                    _index = _["remove"]["index"]
+                    _alias = _["remove"]["alias"]
+                elif _.get("add", ""):
+                    _job_name = "新增"
+                    _index = _["add"]["index"]
+                    _alias = _["add"]["alias"]
+                if all([_job_name, _index, _alias]):
+                    logger.debug("索引[{}]{}别名:{}".format(
+                        _index, _job_name, _alias))
+            logger.info("修改别名成功, POST内容:[{}]".format(str(body)))
+        else:
+            logger.error("修改别名失败, 返回:[{}]".format(str(result)))
+
+    def job_aliases(self, config):
+        '''
+        description: 别名任务
+        '''
+        actions_body = config.get("actions", "")
+        if actions_body:
+            self._exe_update_alias_job(actions_body)
 
     def job_delete(self, config):
         '''
@@ -315,9 +412,13 @@ class PlayBook:
         elif isinstance(index_name, str):
             self._exe_delete_index_job(index_name, save_day)
 
-    def _exe_create_s3_snapshot_job(self, snapshot_repository_name,
-                                    snapshot_repository_post_body, index_list,
-                                    index_body):
+    def _exe_create_snapshot_job(self,
+                                 snapshot_repository_name,
+                                 snapshot_repository_post_body,
+                                 index_list,
+                                 index_body,
+                                 include_mode=False,
+                                 **kwargs):
         '''
         @description:  执行创建快照任务
         @param {string}   snapshot_repository_name 快照仓库名
@@ -347,11 +448,32 @@ class PlayBook:
         index_list = [index_list] if isinstance(index_list,
                                                 str) else index_list
 
-        for _ in index_list:
-            # 渲染
-            post_body = Config.format_data(index_body, {"index": _})
-            result = self.create_snapshot(snapshot_repository_name, _,
-                                          post_body)
+        # 存在快照名
+        if kwargs.get("snapshot_name", None):
+            _all_index_list = self.get_index_list()
+            post_body = Config.format_data(index_body, {
+                "index":
+                ",".join([_ for _ in index_list if _ in _all_index_list])
+            })
+            result = self.create_snapshot(snapshot_repository_name,
+                                          kwargs["snapshot_name"], post_body)
+        else:
+            if include_mode:
+                # 生成一个index任务
+                # 包含该关键字的所有索引
+                for _ in index_list:
+                    _index_list = self.get_index_list("{}*".format(_))
+                    if _index_list:
+                        post_body = Config.format_data(
+                            index_body, {"index": ",".join(_index_list)})
+                        result = self.create_snapshot(snapshot_repository_name,
+                                                      _, post_body)
+            else:
+                for _ in index_list:
+                    # 渲染
+                    post_body = Config.format_data(index_body, {"index": _})
+                    result = self.create_snapshot(snapshot_repository_name, _,
+                                                  post_body)
 
         logger.info("S3快照任务执行完成")
 
@@ -422,9 +544,43 @@ class PlayBook:
         }
 
 
-class Shell:
-    def __init__(self):
-        pass
+class Cmd(Job):
+    def __init__(self, es, job, force=False):
+        self.es = es
+        self.force = force
+        self.job = job
+
+    def job_getReadOnly(self):
+        '''
+        description: 获取只读
+        '''
+        from functools import partial
+        settings = self.es.get_index_settings()
+
+        frozen = lambda x: x["settings"]["index"].get("frozen", "false"
+                                                      ) == "true"
+        blocks_item = lambda i, x: x["settings"]["index"].get("blocks", {
+        }).get(i, "false") == "true"
+        write = partial(blocks_item, "write")
+        read_only = partial(blocks_item, "read_only")
+
+        for i, v in settings.items():
+            item = dict(v)
+            if frozen(item):
+                logger.info("frozen index: {}".format(i))
+
+            if write(item):
+                logger.info("block write: {}".format(i))
+
+            if read_only(item):
+                logger.info("block read_only: {}".format(i))
+
+    def run(self):
+        job = self.get_job(self.job)
+        if job:
+            job()
+        else:
+            logger.error("{}方法没有找到.".format(self.job))
 
 
 class Es(Elasticsearch):
@@ -463,12 +619,6 @@ def main(args):
     @description: 运行主程
     @param {dict} args 传入的参数 
     '''
-    # 实例化Config
-    c = Config(args.c)
-
-    # ES配置
-    ES_URL = c.data["elasticsearch"]["url"]
-    ES = Es(ES_URL, request_timeout=30)
 
     # 强制模式
     force = args.force
@@ -477,6 +627,12 @@ def main(args):
         if not args.playbook:
             logger.error("[playbook]模式, [--playbook]不能为空")
             return
+        # 实例化Config
+        c = Config(args.c)
+
+        # ES配置
+        ES_URL = c.data["elasticsearch"]["url"]
+        ES = Es(ES_URL, request_timeout=30)
 
         # 源数据
         book_config_source = Config.read(args.playbook)
@@ -487,6 +643,14 @@ def main(args):
         # 加载playbook
         playbook = PlayBook(book_config, c.data, ES, force)
         playbook.run()
+
+    if args.mode == "cmd":
+        if not args.s:
+            logger.error("[cmd]模式, [-s]不能为空")
+            return
+        ES = Es(args.s)
+        cmd = Cmd(ES, args.cmd)
+        cmd.run()
 
 
 if __name__ == "__main__":

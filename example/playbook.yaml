@@ -1,19 +1,15 @@
 - job: delete
   index:
-    - "elastalert_status*"
-  save: 7
-
-- job: delete
-  index:
-    - "access*"
-  save: 31
+    # nginx日志保留30天
+    - "logstash-nginx_access_*"
+  save: 30
 
 - job: backup
   type: s3
   index:
-    - "access-{today_one}"
-    - "mcafee_audit_{today_two}"
-    - "system_secure_{today_two}"
+    - "system_history_{yesterday_two}"
+    - "mysql_audit-{yesterday_two}"
+    - ".kibana"
   body:
     # index为特殊变量, 自动循环替换
     indices: "{index}"

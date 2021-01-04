@@ -2,14 +2,20 @@
 elasticsearch:
   url: "http://192.168.1.1:9200"
 
+
 # 变量
 env:
   today_one: 
     shell: "date +%Y.%m.%d"
   today_two:
     shell: "date +%Y%m%d"
+  month:
+    shell: "date +%Y%m"
 
 snapshot:
+  # 每天一个仓库
+  # 推荐: 每月一个仓库
+  # repository: "{month}" 
   repository: "{today_two}" 
   body:
     type: "s3"

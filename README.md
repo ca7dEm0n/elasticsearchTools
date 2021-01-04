@@ -1,4 +1,4 @@
-# elasticsearchTools 
+# esTools 
 
 [![Python2.7](https://img.shields.io/badge/Python-2.7-green.svg?style=plastic)](https://www.python.org/)
 
@@ -26,14 +26,16 @@
 
 ```
 usage: esTools.py [-h] [-v] [-c C] [-q] [--playbook PLAYBOOK] [--force]
-                  {playbook,shell}
+                  {playbook,cmd}
 
 positional arguments:
-  {playbook,shell}     选择运行模式: playbook/shell
+  {playbook,cmd}     选择运行模式: playbook/shell
 
 optional arguments:
   -h, --help           show this help message and exit
   -v                   -vv开启DEBUG模式，默认-v
+  -s                   指定es主机
+  -cmd                 执行cmd的方法名
   -c C                 指定配置文件，默认config.yaml
   -q                   安静模式
   --playbook PLAYBOOK  playbook
@@ -59,7 +61,7 @@ elasticsearch:
 ```yaml
 env:
 	# 返回: {"today": "20190101"}
-	today: "20190101"    				# 默认方式
+    today: "20190101"    				# 默认方式
 	
 	# 运行shell获取结果
 	# 返回: {"today_one": "2019.09.26"}
@@ -79,7 +81,7 @@ env:
 示例：
 ```yaml
 snapshot:
-	# 用变量方式定义快照仓库名
+  # 用变量方式定义快照仓库名
   repository: "{today_one}" 
   body:
   	# 仓库的POST信息
@@ -108,9 +110,14 @@ snapshot:
 - `index` 需要快照的`index`.
 - `body`  创建快照参数，`{index}`为特殊变量，可自动循环替换
 
-## 结合crontab使用
+## Cmd
+
+**readOnly**
+
+> 获取当前只读索引
+
+示例:
 
 ```shell
-# 每天凌晨运行
-0 0 * * * sh /root/scripts/estools/run.sh playbook
+python esTools.py cmd -cmd getReadOnly -s http://192.168.1.1:9200
 ```
